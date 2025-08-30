@@ -24,6 +24,7 @@ import (
 	"regexp"
 	"slices"
 	"syscall"
+	"time"
 
 	"github.com/pion/webrtc/v4"
 	"github.com/urfave/cli/v3"
@@ -202,6 +203,16 @@ var (
 						&cli.StringFlag{
 							Name:  "metadata",
 							Usage: "`JSON` metadata which will be passed to participant",
+						},
+						&cli.IntFlag{
+							Name:  "reconnect-attempts",
+							Usage: "Number of reconnection attempts for failed streams (0 = no reconnection, -1 = infinite)",
+							Value: 5,
+						},
+						&cli.DurationFlag{
+							Name:  "reconnect-delay",
+							Usage: "Delay between reconnection attempts",
+							Value: time.Second * 2,
 						},
 					},
 				},
@@ -1018,6 +1029,8 @@ func joinRoom(ctx context.Context, cmd *cli.Command) error {
 			// Handle single publish
 			fps := cmd.Float("fps")
 			h26xStreamingFormat := cmd.String("h26x-streaming-format")
+			reconnectAttempts := cmd.Int("reconnect-attempts")
+			reconnectDelay := cmd.Duration("reconnect-delay")
 			for _, pub := range publishUrls {
 				onPublishComplete := func(pub *lksdk.LocalTrackPublication) {
 					if exitAfterPublish {
@@ -1029,7 +1042,7 @@ func joinRoom(ctx context.Context, cmd *cli.Command) error {
 						_ = room.LocalParticipant.UnpublishTrack(pub.SID())
 					}
 				}
-				if err = handlePublish(room, pub, fps, h26xStreamingFormat, attachFrameMetadata, onPublishComplete); err != nil {
+				if err = handlePublishWithReconnection(ctx, room, pub, fps, h26xStreamingFormat, attachFrameMetadata, onPublishComplete, reconnectAttempts, reconnectDelay); err != nil {
 					return err
 				}
 			}

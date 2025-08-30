@@ -215,6 +215,26 @@ func handlePublish(room *lksdk.Room,
 	return publishFile(room, name, fps, h26xStreamingFormat, attachFrameMetadata, onPublishComplete)
 }
 
+func handlePublishWithReconnection(ctx context.Context,
+	room *lksdk.Room,
+	name string,
+	fps float64,
+	h26xStreamingFormat string,
+	attachFrameMetadata bool,
+	onPublishComplete func(pub *lksdk.LocalTrackPublication),
+	reconnectAttempts int,
+	reconnectDelay time.Duration,
+) error {
+	if isSocketFormat(name) {
+		mimeType, socketType, address, err := parseSocketFromName(name)
+		if err != nil {
+			return err
+		}
+		return publishSocketWithReconnection(ctx, room, mimeType, socketType, address, fps, h26xStreamingFormat, attachFrameMetadata, onPublishComplete, reconnectAttempts, reconnectDelay)
+	}
+	return publishFile(room, name, fps, h26xStreamingFormat, attachFrameMetadata, onPublishComplete)
+}
+
 func publishDemo(room *lksdk.Room) error {
 	var tracks []*lksdk.LocalTrack
 
@@ -332,6 +352,21 @@ func isSocketFormat(name string) bool {
 	return strings.Contains(name, mimeDelimiter)
 }
 
+func getMimeType(codecType string) (string, error) {
+	switch {
+	case strings.Contains(codecType, "h264"):
+		return webrtc.MimeTypeH264, nil
+	case strings.Contains(codecType, "h265"):
+		return webrtc.MimeTypeH265, nil
+	case strings.Contains(codecType, "vp8"):
+		return webrtc.MimeTypeVP8, nil
+	case strings.Contains(codecType, "opus"):
+		return webrtc.MimeTypeOpus, nil
+	default:
+		return "", lksdk.ErrUnsupportedFileType
+	}
+}
+
 func publishSocket(room *lksdk.Room,
 	mimeType string,
 	socketType string,
@@ -341,29 +376,143 @@ func publishSocket(room *lksdk.Room,
 	attachFrameMetadata bool,
 	onPublishComplete func(pub *lksdk.LocalTrackPublication),
 ) error {
-	var mime string
-	switch {
-	case strings.Contains(mimeType, "h264"):
-		mime = webrtc.MimeTypeH264
-	case strings.Contains(mimeType, "h265"):
-		mime = webrtc.MimeTypeH265
-	case strings.Contains(mimeType, "vp8"):
-		mime = webrtc.MimeTypeVP8
-	case strings.Contains(mimeType, "opus"):
-		mime = webrtc.MimeTypeOpus
-	default:
-		return lksdk.ErrUnsupportedFileType
+	return publishSocketWithReconnection(context.Background(), room, mimeType, socketType, address, fps, h26xStreamingFormat, attachFrameMetadata, onPublishComplete, 0, 0)
+}
+
+func runReconnectionManager(ctx context.Context,
+	room *lksdk.Room,
+	mimeType string,
+	socketType string,
+	address string,
+	fps float64,
+	h26xStreamingFormat string,
+	attachFrameMetadata bool,
+	onPublishComplete func(pub *lksdk.LocalTrackPublication),
+	reconnectAttempts int,
+	reconnectDelay time.Duration,
+) {
+	mime, err := getMimeType(mimeType)
+	if err != nil {
+		logger.Infow("invalid mime type", "mimeType", mimeType, "error", err)
+		return
 	}
 
-	// Dial socket
-	sock, err := net.Dial(socketType, address)
+	var currentPub *lksdk.LocalTrackPublication
+	totalAttempts := 0
+
+	for {
+		select {
+		case <-ctx.Done():
+			if currentPub != nil {
+				_ = room.LocalParticipant.UnpublishTrack(currentPub.SID())
+				logger.Infow("unpublished track on shutdown", "trackID", currentPub.SID())
+			}
+			return
+		default:
+		}
+
+		// Check if we've exceeded max attempts
+		if reconnectAttempts > 0 && totalAttempts >= reconnectAttempts {
+			logger.Infow("max reconnection attempts reached", "address", address, "attempts", reconnectAttempts)
+			if onPublishComplete != nil && currentPub != nil {
+				onPublishComplete(currentPub)
+			}
+			return
+		}
+
+		// Dial socket
+		sock, err := net.Dial(socketType, address)
+		if err != nil {
+			totalAttempts++
+			logger.Infow("failed to connect to socket, retrying",
+				"address", address,
+				"attempt", totalAttempts,
+				"error", err,
+				"retry_in", reconnectDelay,
+			)
+
+			// Use context-aware sleep
+			select {
+			case <-ctx.Done():
+				return
+			case <-time.After(reconnectDelay):
+			}
+			continue
+		}
+
+		logger.Infow("socket stream connected", "address", address, "attempt", totalAttempts+1)
+
+		// Unpublish previous track if it exists
+		if currentPub != nil {
+			_ = room.LocalParticipant.UnpublishTrack(currentPub.SID())
+			logger.Infow("unpublished previous track", "trackID", currentPub.SID())
+		}
+
+		// Publish new track
+		streamDone := make(chan *lksdk.LocalTrackPublication, 1)
+		completionCallback := func(pub *lksdk.LocalTrackPublication) {
+			streamDone <- pub
+		}
+
+		err = publishReader(room, sock, mime, fps, h26xStreamingFormat, attachFrameMetadata, completionCallback)
+		if err != nil {
+			sock.Close()
+			totalAttempts++
+			logger.Infow("publish failed, retrying",
+				"address", address,
+				"attempt", totalAttempts,
+				"error", err,
+				"retry_in", reconnectDelay,
+			)
+			time.Sleep(reconnectDelay)
+			continue
+		}
+
+		// Wait for stream to complete, then loop to reconnect
+		select {
+		case <-ctx.Done():
+			return
+		case currentPub = <-streamDone:
+			logger.Infow("socket stream ended, attempting reconnection", "address", address)
+		}
+
+		// Context-aware delay before reconnection
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(reconnectDelay):
+		}
+	}
+}
+
+func publishSocketWithReconnection(ctx context.Context,
+	room *lksdk.Room,
+	mimeType string,
+	socketType string,
+	address string,
+	fps float64,
+	h26xStreamingFormat string,
+	attachFrameMetadata bool,
+	onPublishComplete func(pub *lksdk.LocalTrackPublication),
+	reconnectAttempts int,
+	reconnectDelay time.Duration,
+) error {
+	mime, err := getMimeType(mimeType)
 	if err != nil {
 		return err
 	}
+	// If no reconnection, use simple approach
+	if reconnectAttempts == 0 {
+		sock, err := net.Dial(socketType, address)
+		if err != nil {
+			return err
+		}
+		return publishReader(room, sock, mime, fps, h26xStreamingFormat, attachFrameMetadata, onPublishComplete)
+	}
 
-	// Publish to room
-	err = publishReader(room, sock, mime, fps, h26xStreamingFormat, attachFrameMetadata, onPublishComplete)
-	return err
+	// Start reconnection manager in separate goroutine
+	go runReconnectionManager(ctx, room, mimeType, socketType, address, fps, h26xStreamingFormat, attachFrameMetadata, onPublishComplete, reconnectAttempts, reconnectDelay)
+	return nil
 }
 
 func publishReader(room *lksdk.Room,
