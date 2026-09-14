@@ -188,6 +188,12 @@ var (
 								"so a live socket source paces the track and no backlog builds up; --user-timestamp-pacing=false falls back to fixed --fps pacing",
 						},
 						&cli.BoolFlag{
+							Name: "h265-single-slice-flush",
+							Usage: "H265 only: publish each access unit as soon as its slice arrives instead of holding it until the next access unit starts (one frame of latency). " +
+								"Only for streams with one slice per picture (hardware encoders); with multiple slices per picture every slice would be sent as its own frame. " +
+								"Not needed when the stream terminates each access unit with an AUD",
+						},
+						&cli.BoolFlag{
 							Name:  "exit-after-publish",
 							Usage: "When publishing, exit after file or stream is complete",
 						},
@@ -999,8 +1005,9 @@ func joinRoom(ctx context.Context, cmd *cli.Command) error {
 
 	exitAfterPublish := cmd.Bool("exit-after-publish")
 	attachFrameMetadata := frameMetadataOptions{
-		attach:              cmd.Bool("attach-frame-metadata"),
-		userTimestampPacing: cmd.Bool("user-timestamp-pacing"),
+		attach:               cmd.Bool("attach-frame-metadata"),
+		userTimestampPacing:  cmd.Bool("user-timestamp-pacing"),
+		h265SingleSliceFlush: cmd.Bool("h265-single-slice-flush"),
 	}
 
 	// Handle publishing

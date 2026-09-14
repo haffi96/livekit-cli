@@ -72,6 +72,12 @@ var (
 					Usage: "with --attach-frame-metadata: stamp each frame with the SEI user timestamp (capture time) and send it as soon as it is read, " +
 						"so a live socket source paces the track and no backlog builds up; --user-timestamp-pacing=false falls back to fixed --fps pacing",
 				},
+				&cli.BoolFlag{
+					Name: "h265-single-slice-flush",
+					Usage: "H265 only: publish each access unit as soon as its slice arrives instead of holding it until the next access unit starts (one frame of latency). " +
+						"Only for streams with one slice per picture (hardware encoders); with multiple slices per picture every slice would be sent as its own frame. " +
+						"Not needed when the stream terminates each access unit with an AUD",
+				},
 				&cli.FloatFlag{
 					Name:  "fps",
 					Usage: "if video files are published, indicates FPS of video",
@@ -183,8 +189,9 @@ func _deprecatedJoinRoom(ctx context.Context, cmd *cli.Command) error {
 		fps := cmd.Float("fps")
 		h26xStreamingFormat := cmd.String("h26x-streaming-format")
 		attachFrameMetadata := frameMetadataOptions{
-			attach:              cmd.Bool("attach-frame-metadata"),
-			userTimestampPacing: cmd.Bool("user-timestamp-pacing"),
+			attach:               cmd.Bool("attach-frame-metadata"),
+			userTimestampPacing:  cmd.Bool("user-timestamp-pacing"),
+			h265SingleSliceFlush: cmd.Bool("h265-single-slice-flush"),
 		}
 		for _, pub := range cmd.StringSlice("publish") {
 			onPublishComplete := func(pub *lksdk.LocalTrackPublication) {
@@ -294,6 +301,9 @@ func publishFile(room *lksdk.Room,
 		opts = append(opts, lksdk.ReaderTrackWithPacketTrailer(true))
 		opts = append(opts, lksdk.ReaderTrackWithUserTimestampPacing(attachFrameMetadata.userTimestampPacing))
 	}
+	if attachFrameMetadata.h265SingleSliceFlush {
+		opts = append(opts, lksdk.ReaderTrackWithH265SingleSliceFlush(true))
+	}
 
 	// Create track and publish
 	track, err := lksdk.NewLocalFileTrack(filename, opts...)
@@ -379,11 +389,13 @@ func publishSocket(room *lksdk.Room,
 	return err
 }
 
-// frameMetadataOptions controls LKTS frame metadata handling for published
-// H264/H265 streams (--attach-frame-metadata, --user-timestamp-pacing).
+// frameMetadataOptions controls LKTS frame metadata handling and access unit
+// delivery for published H264/H265 streams (--attach-frame-metadata,
+// --user-timestamp-pacing, --h265-single-slice-flush).
 type frameMetadataOptions struct {
-	attach              bool
-	userTimestampPacing bool
+	attach               bool
+	userTimestampPacing  bool
+	h265SingleSliceFlush bool
 }
 
 // lazySocket is an io.ReadCloser that dials on the first Read. Live sources
@@ -476,6 +488,9 @@ func publishReader(room *lksdk.Room,
 	if attachFrameMetadata.attach {
 		opts = append(opts, lksdk.ReaderTrackWithPacketTrailer(true))
 		opts = append(opts, lksdk.ReaderTrackWithUserTimestampPacing(attachFrameMetadata.userTimestampPacing))
+	}
+	if attachFrameMetadata.h265SingleSliceFlush {
+		opts = append(opts, lksdk.ReaderTrackWithH265SingleSliceFlush(true))
 	}
 
 	// Create track and publish
@@ -570,6 +585,9 @@ func createSimulcastVideoTrack(urlParts *simulcastURLParts, quality livekit.Vide
 	if attachFrameMetadata.attach {
 		opts = append(opts, lksdk.ReaderTrackWithPacketTrailer(true))
 		opts = append(opts, lksdk.ReaderTrackWithUserTimestampPacing(attachFrameMetadata.userTimestampPacing))
+	}
+	if attachFrameMetadata.h265SingleSliceFlush {
+		opts = append(opts, lksdk.ReaderTrackWithH265SingleSliceFlush(true))
 	}
 
 	// Configure simulcast layer
