@@ -66,6 +66,12 @@ var (
 					Usage:  "Parse H264/H265 SEI for LKTS frame metadata (user timestamp and frame ID) and re-attach the packet trailer to each encoded frame",
 					Hidden: true,
 				},
+				&cli.BoolFlag{
+					Name: "h265-single-slice-flush",
+					Usage: "H265 only: publish each access unit as soon as its slice arrives instead of holding it until the next access unit starts (one frame of latency). " +
+						"Only for streams with one slice per picture (hardware encoders); with multiple slices per picture every slice would be sent as its own frame. " +
+						"Not needed when the stream terminates each access unit with an AUD",
+				},
 				&cli.FloatFlag{
 					Name:  "fps",
 					Usage: "if video files are published, indicates FPS of video",
@@ -177,6 +183,7 @@ func _deprecatedJoinRoom(ctx context.Context, cmd *cli.Command) error {
 		fps := cmd.Float("fps")
 		h26xStreamingFormat := cmd.String("h26x-streaming-format")
 		attachFrameMetadata := cmd.Bool("attach-frame-metadata")
+		h265SingleSliceFlush := cmd.Bool("h265-single-slice-flush")
 		for _, pub := range cmd.StringSlice("publish") {
 			onPublishComplete := func(pub *lksdk.LocalTrackPublication) {
 				if cmd.Bool("exit-after-publish") {
@@ -188,7 +195,7 @@ func _deprecatedJoinRoom(ctx context.Context, cmd *cli.Command) error {
 					_ = room.LocalParticipant.UnpublishTrack(pub.SID())
 				}
 			}
-			if err = handlePublish(room, pub, fps, h26xStreamingFormat, attachFrameMetadata, onPublishComplete); err != nil {
+			if err = handlePublish(room, pub, fps, h26xStreamingFormat, attachFrameMetadata, h265SingleSliceFlush, onPublishComplete); err != nil {
 				return err
 			}
 		}
@@ -203,6 +210,7 @@ func handlePublish(room *lksdk.Room,
 	fps float64,
 	h26xStreamingFormat string,
 	attachFrameMetadata bool,
+	h265SingleSliceFlush bool,
 	onPublishComplete func(pub *lksdk.LocalTrackPublication),
 ) error {
 	if isSocketFormat(name) {
@@ -210,9 +218,9 @@ func handlePublish(room *lksdk.Room,
 		if err != nil {
 			return err
 		}
-		return publishSocket(room, mimeType, socketType, address, fps, h26xStreamingFormat, attachFrameMetadata, onPublishComplete)
+		return publishSocket(room, mimeType, socketType, address, fps, h26xStreamingFormat, attachFrameMetadata, h265SingleSliceFlush, onPublishComplete)
 	}
-	return publishFile(room, name, fps, h26xStreamingFormat, attachFrameMetadata, onPublishComplete)
+	return publishFile(room, name, fps, h26xStreamingFormat, attachFrameMetadata, h265SingleSliceFlush, onPublishComplete)
 }
 
 func publishDemo(room *lksdk.Room) error {
@@ -246,6 +254,7 @@ func publishFile(room *lksdk.Room,
 	fps float64,
 	h26xStreamingFormat string,
 	attachFrameMetadata bool,
+	h265SingleSliceFlush bool,
 	onPublishComplete func(pub *lksdk.LocalTrackPublication),
 ) error {
 	// Configure provider
@@ -283,6 +292,9 @@ func publishFile(room *lksdk.Room,
 	}
 	if attachFrameMetadata {
 		opts = append(opts, lksdk.ReaderTrackWithPacketTrailer(true))
+	}
+	if h265SingleSliceFlush {
+		opts = append(opts, lksdk.ReaderTrackWithH265SingleSliceFlush(true))
 	}
 
 	// Create track and publish
@@ -339,6 +351,7 @@ func publishSocket(room *lksdk.Room,
 	fps float64,
 	h26xStreamingFormat string,
 	attachFrameMetadata bool,
+	h265SingleSliceFlush bool,
 	onPublishComplete func(pub *lksdk.LocalTrackPublication),
 ) error {
 	var mime string
@@ -362,7 +375,7 @@ func publishSocket(room *lksdk.Room,
 	}
 
 	// Publish to room
-	err = publishReader(room, sock, mime, fps, h26xStreamingFormat, attachFrameMetadata, onPublishComplete)
+	err = publishReader(room, sock, mime, fps, h26xStreamingFormat, attachFrameMetadata, h265SingleSliceFlush, onPublishComplete)
 	return err
 }
 
@@ -372,6 +385,7 @@ func publishReader(room *lksdk.Room,
 	fps float64,
 	h26xStreamingFormat string,
 	attachFrameMetadata bool,
+	h265SingleSliceFlush bool,
 	onPublishComplete func(pub *lksdk.LocalTrackPublication),
 ) error {
 	// Configure provider
@@ -402,6 +416,9 @@ func publishReader(room *lksdk.Room,
 
 	if attachFrameMetadata {
 		opts = append(opts, lksdk.ReaderTrackWithPacketTrailer(true))
+	}
+	if h265SingleSliceFlush {
+		opts = append(opts, lksdk.ReaderTrackWithH265SingleSliceFlush(true))
 	}
 
 	// Create track and publish
@@ -464,7 +481,7 @@ func parseSimulcastURL(url string) (*simulcastURLParts, error) {
 }
 
 // createSimulcastVideoTrack creates a simulcast video track from a TCP or Unix socket H.264/H.265 streams
-func createSimulcastVideoTrack(urlParts *simulcastURLParts, quality livekit.VideoQuality, fps float64, h26xStreamingFormat string, attachFrameMetadata bool, onComplete func()) (*lksdk.LocalTrack, error) {
+func createSimulcastVideoTrack(urlParts *simulcastURLParts, quality livekit.VideoQuality, fps float64, h26xStreamingFormat string, attachFrameMetadata bool, h265SingleSliceFlush bool, onComplete func()) (*lksdk.LocalTrack, error) {
 	conn, err := net.Dial(urlParts.network, urlParts.address)
 	if err != nil {
 		return nil, fmt.Errorf("failed to connect to %s://%s: %w", urlParts.network, urlParts.address, err)
@@ -495,6 +512,9 @@ func createSimulcastVideoTrack(urlParts *simulcastURLParts, quality livekit.Vide
 	if attachFrameMetadata {
 		opts = append(opts, lksdk.ReaderTrackWithPacketTrailer(true))
 	}
+	if h265SingleSliceFlush {
+		opts = append(opts, lksdk.ReaderTrackWithH265SingleSliceFlush(true))
+	}
 
 	// Configure simulcast layer
 	opts = append(opts, lksdk.ReaderTrackWithSampleOptions(lksdk.WithSimulcast("simulcast", &livekit.VideoLayer{
@@ -519,7 +539,7 @@ type simulcastLayer struct {
 }
 
 // handleSimulcastPublish handles publishing multiple H.264 streams as a simulcast track
-func handleSimulcastPublish(room *lksdk.Room, urls []string, fps float64, h26xStreamingFormat string, attachFrameMetadata bool, onPublishComplete func(*lksdk.LocalTrackPublication)) error {
+func handleSimulcastPublish(room *lksdk.Room, urls []string, fps float64, h26xStreamingFormat string, attachFrameMetadata bool, h265SingleSliceFlush bool, onPublishComplete func(*lksdk.LocalTrackPublication)) error {
 	// Parse all URLs
 	var layers []simulcastLayer
 	for _, url := range urls {
@@ -590,7 +610,7 @@ func handleSimulcastPublish(room *lksdk.Room, urls []string, fps float64, h26xSt
 	}
 
 	for _, layer := range layers {
-		track, err := createSimulcastVideoTrack(layer.parts, layer.quality, fps, h26xStreamingFormat, attachFrameMetadata, signalCompletion)
+		track, err := createSimulcastVideoTrack(layer.parts, layer.quality, fps, h26xStreamingFormat, attachFrameMetadata, h265SingleSliceFlush, signalCompletion)
 		if err != nil {
 			// Clean up any tracks we've already created
 			for _, t := range tracks {
