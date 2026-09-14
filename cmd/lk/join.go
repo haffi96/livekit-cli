@@ -66,6 +66,12 @@ var (
 					Usage:  "Parse H264/H265 SEI for LKTS frame metadata (user timestamp and frame ID) and re-attach the packet trailer to each encoded frame",
 					Hidden: true,
 				},
+				&cli.BoolFlag{
+					Name:  "user-timestamp-pacing",
+					Value: true,
+					Usage: "with --attach-frame-metadata: stamp each frame with the SEI user timestamp (capture time) and send it as soon as it is read, " +
+						"so a live socket source paces the track and no backlog builds up; --user-timestamp-pacing=false falls back to fixed --fps pacing",
+				},
 				&cli.FloatFlag{
 					Name:  "fps",
 					Usage: "if video files are published, indicates FPS of video",
@@ -176,7 +182,10 @@ func _deprecatedJoinRoom(ctx context.Context, cmd *cli.Command) error {
 	if cmd.StringSlice("publish") != nil {
 		fps := cmd.Float("fps")
 		h26xStreamingFormat := cmd.String("h26x-streaming-format")
-		attachFrameMetadata := cmd.Bool("attach-frame-metadata")
+		attachFrameMetadata := frameMetadataOptions{
+			attach:              cmd.Bool("attach-frame-metadata"),
+			userTimestampPacing: cmd.Bool("user-timestamp-pacing"),
+		}
 		for _, pub := range cmd.StringSlice("publish") {
 			onPublishComplete := func(pub *lksdk.LocalTrackPublication) {
 				if cmd.Bool("exit-after-publish") {
@@ -202,7 +211,7 @@ func handlePublish(room *lksdk.Room,
 	name string,
 	fps float64,
 	h26xStreamingFormat string,
-	attachFrameMetadata bool,
+	attachFrameMetadata frameMetadataOptions,
 	onPublishComplete func(pub *lksdk.LocalTrackPublication),
 ) error {
 	if isSocketFormat(name) {
@@ -245,7 +254,7 @@ func publishFile(room *lksdk.Room,
 	filename string,
 	fps float64,
 	h26xStreamingFormat string,
-	attachFrameMetadata bool,
+	attachFrameMetadata frameMetadataOptions,
 	onPublishComplete func(pub *lksdk.LocalTrackPublication),
 ) error {
 	// Configure provider
@@ -281,8 +290,9 @@ func publishFile(room *lksdk.Room,
 			return fmt.Errorf("unsupported h26x streaming format: %s", h26xStreamingFormat)
 		}
 	}
-	if attachFrameMetadata {
+	if attachFrameMetadata.attach {
 		opts = append(opts, lksdk.ReaderTrackWithPacketTrailer(true))
+		opts = append(opts, lksdk.ReaderTrackWithUserTimestampPacing(attachFrameMetadata.userTimestampPacing))
 	}
 
 	// Create track and publish
@@ -292,8 +302,8 @@ func publishFile(room *lksdk.Room,
 	}
 	pub, err = room.LocalParticipant.PublishTrack(track, &lksdk.TrackPublicationOptions{
 		Name:                filename,
-		AttachUserTimestamp: attachFrameMetadata,
-		AttachFrameId:       attachFrameMetadata,
+		AttachUserTimestamp: attachFrameMetadata.attach,
+		AttachFrameId:       attachFrameMetadata.attach,
 	})
 	return err
 }
@@ -338,7 +348,7 @@ func publishSocket(room *lksdk.Room,
 	address string,
 	fps float64,
 	h26xStreamingFormat string,
-	attachFrameMetadata bool,
+	attachFrameMetadata frameMetadataOptions,
 	onPublishComplete func(pub *lksdk.LocalTrackPublication),
 ) error {
 	var mime string
@@ -355,8 +365,11 @@ func publishSocket(room *lksdk.Room,
 		return lksdk.ErrUnsupportedFileType
 	}
 
-	// Dial socket
-	sock, err := net.Dial(socketType, address)
+	// Dial lazily: the track only starts reading once it is bound, after
+	// signalling and negotiation. A socket opened now would accumulate
+	// everything the source sends in between, and the SDK's paced writer
+	// would carry that backlog as a permanent delay (see lazySocket).
+	sock, err := newLazySocket(socketType, address)
 	if err != nil {
 		return err
 	}
@@ -366,12 +379,72 @@ func publishSocket(room *lksdk.Room,
 	return err
 }
 
+// frameMetadataOptions controls LKTS frame metadata handling for published
+// H264/H265 streams (--attach-frame-metadata, --user-timestamp-pacing).
+type frameMetadataOptions struct {
+	attach              bool
+	userTimestampPacing bool
+}
+
+// lazySocket is an io.ReadCloser that dials on the first Read. Live sources
+// such as a camera pipeline behind tcpserversink keep sending whether or not
+// the client reads; connecting only when the sample provider starts reading
+// means the first frame delivered is the current one, not one buffered while
+// the track was being published. A probe connection is made up front so
+// unreachable addresses still fail at startup.
+type lazySocket struct {
+	network string
+	address string
+
+	mu     sync.Mutex
+	conn   net.Conn
+	closed bool
+}
+
+func newLazySocket(network, address string) (*lazySocket, error) {
+	probe, err := net.Dial(network, address)
+	if err != nil {
+		return nil, err
+	}
+	_ = probe.Close()
+	return &lazySocket{network: network, address: address}, nil
+}
+
+func (l *lazySocket) Read(p []byte) (int, error) {
+	l.mu.Lock()
+	if l.closed {
+		l.mu.Unlock()
+		return 0, net.ErrClosed
+	}
+	if l.conn == nil {
+		conn, err := net.Dial(l.network, l.address)
+		if err != nil {
+			l.mu.Unlock()
+			return 0, err
+		}
+		l.conn = conn
+	}
+	conn := l.conn
+	l.mu.Unlock()
+	return conn.Read(p)
+}
+
+func (l *lazySocket) Close() error {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.closed = true
+	if l.conn == nil {
+		return nil
+	}
+	return l.conn.Close()
+}
+
 func publishReader(room *lksdk.Room,
 	in io.ReadCloser,
 	mime string,
 	fps float64,
 	h26xStreamingFormat string,
-	attachFrameMetadata bool,
+	attachFrameMetadata frameMetadataOptions,
 	onPublishComplete func(pub *lksdk.LocalTrackPublication),
 ) error {
 	// Configure provider
@@ -400,8 +473,9 @@ func publishReader(room *lksdk.Room,
 		}
 	}
 
-	if attachFrameMetadata {
+	if attachFrameMetadata.attach {
 		opts = append(opts, lksdk.ReaderTrackWithPacketTrailer(true))
+		opts = append(opts, lksdk.ReaderTrackWithUserTimestampPacing(attachFrameMetadata.userTimestampPacing))
 	}
 
 	// Create track and publish
@@ -410,8 +484,8 @@ func publishReader(room *lksdk.Room,
 		return err
 	}
 	pub, err = room.LocalParticipant.PublishTrack(track, &lksdk.TrackPublicationOptions{
-		AttachUserTimestamp: attachFrameMetadata,
-		AttachFrameId:       attachFrameMetadata,
+		AttachUserTimestamp: attachFrameMetadata.attach,
+		AttachFrameId:       attachFrameMetadata.attach,
 	})
 	if err != nil {
 		return err
@@ -464,8 +538,9 @@ func parseSimulcastURL(url string) (*simulcastURLParts, error) {
 }
 
 // createSimulcastVideoTrack creates a simulcast video track from a TCP or Unix socket H.264/H.265 streams
-func createSimulcastVideoTrack(urlParts *simulcastURLParts, quality livekit.VideoQuality, fps float64, h26xStreamingFormat string, attachFrameMetadata bool, onComplete func()) (*lksdk.LocalTrack, error) {
-	conn, err := net.Dial(urlParts.network, urlParts.address)
+func createSimulcastVideoTrack(urlParts *simulcastURLParts, quality livekit.VideoQuality, fps float64, h26xStreamingFormat string, attachFrameMetadata frameMetadataOptions, onComplete func()) (*lksdk.LocalTrack, error) {
+	// Dial lazily so no backlog builds up before the track is bound (see lazySocket).
+	conn, err := newLazySocket(urlParts.network, urlParts.address)
 	if err != nil {
 		return nil, fmt.Errorf("failed to connect to %s://%s: %w", urlParts.network, urlParts.address, err)
 	}
@@ -492,8 +567,9 @@ func createSimulcastVideoTrack(urlParts *simulcastURLParts, quality livekit.Vide
 		return nil, fmt.Errorf("unsupported h26x streaming format: %s", h26xStreamingFormat)
 	}
 
-	if attachFrameMetadata {
+	if attachFrameMetadata.attach {
 		opts = append(opts, lksdk.ReaderTrackWithPacketTrailer(true))
+		opts = append(opts, lksdk.ReaderTrackWithUserTimestampPacing(attachFrameMetadata.userTimestampPacing))
 	}
 
 	// Configure simulcast layer
@@ -519,7 +595,7 @@ type simulcastLayer struct {
 }
 
 // handleSimulcastPublish handles publishing multiple H.264 streams as a simulcast track
-func handleSimulcastPublish(room *lksdk.Room, urls []string, fps float64, h26xStreamingFormat string, attachFrameMetadata bool, onPublishComplete func(*lksdk.LocalTrackPublication)) error {
+func handleSimulcastPublish(room *lksdk.Room, urls []string, fps float64, h26xStreamingFormat string, attachFrameMetadata frameMetadataOptions, onPublishComplete func(*lksdk.LocalTrackPublication)) error {
 	// Parse all URLs
 	var layers []simulcastLayer
 	for _, url := range urls {
@@ -607,8 +683,8 @@ func handleSimulcastPublish(room *lksdk.Room, urls []string, fps float64, h26xSt
 	var err error
 	pub, err = room.LocalParticipant.PublishSimulcastTrack(tracks, &lksdk.TrackPublicationOptions{
 		Name:                "simulcast",
-		AttachUserTimestamp: attachFrameMetadata,
-		AttachFrameId:       attachFrameMetadata,
+		AttachUserTimestamp: attachFrameMetadata.attach,
+		AttachFrameId:       attachFrameMetadata.attach,
 	})
 	if err != nil {
 		// Clean up tracks on publish failure

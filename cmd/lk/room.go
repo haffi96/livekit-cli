@@ -182,6 +182,12 @@ var (
 							Usage: "Parse H264/H265 SEI for LKTS frame metadata (user timestamp and frame ID) and append packet trailer to each encoded frame",
 						},
 						&cli.BoolFlag{
+							Name:  "user-timestamp-pacing",
+							Value: true,
+							Usage: "with --attach-frame-metadata: stamp each frame with the SEI user timestamp (capture time) and send it as soon as it is read, " +
+								"so a live socket source paces the track and no backlog builds up; --user-timestamp-pacing=false falls back to fixed --fps pacing",
+						},
+						&cli.BoolFlag{
 							Name:  "exit-after-publish",
 							Usage: "When publishing, exit after file or stream is complete",
 						},
@@ -992,7 +998,10 @@ func joinRoom(ctx context.Context, cmd *cli.Command) error {
 	}
 
 	exitAfterPublish := cmd.Bool("exit-after-publish")
-	attachFrameMetadata := cmd.Bool("attach-frame-metadata")
+	attachFrameMetadata := frameMetadataOptions{
+		attach:              cmd.Bool("attach-frame-metadata"),
+		userTimestampPacing: cmd.Bool("user-timestamp-pacing"),
+	}
 
 	// Handle publishing
 	if len(publishUrls) > 0 {

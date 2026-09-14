@@ -20,7 +20,7 @@ require (
 	github.com/google/go-querystring v1.2.0
 	github.com/joho/godotenv v1.5.1
 	github.com/klauspost/compress v1.20.0
-	github.com/livekit/protocol v1.51.1-0.20260908073808-6cde54c87840
+	github.com/livekit/protocol v1.51.1-0.20260910121219-271d9cde3897
 	github.com/livekit/server-sdk-go/v2 v2.18.2-0.20260904062056-1da58cd7b795
 	github.com/mattn/go-isatty v0.0.22
 	github.com/moby/moby/client v0.4.1
@@ -40,7 +40,7 @@ require (
 	golang.org/x/time v0.15.0
 	google.golang.org/protobuf v1.36.12
 	gopkg.in/yaml.v3 v3.0.1
-	k8s.io/apimachinery v0.36.1
+	k8s.io/apimachinery v0.36.3
 )
 
 require (
@@ -100,12 +100,12 @@ require (
 	github.com/cncf/xds/go v0.0.0-20260202195803-dba9d589def2 // indirect
 	github.com/containerd/console v1.0.5 // indirect
 	github.com/containerd/containerd/api v1.11.1 // indirect
-	github.com/containerd/containerd/v2 v2.3.3 // indirect
+	github.com/containerd/containerd/v2 v2.3.5 // indirect
 	github.com/containerd/continuity v0.5.0 // indirect
 	github.com/containerd/errdefs v1.0.0 // indirect
 	github.com/containerd/errdefs/pkg v0.3.0 // indirect
 	github.com/containerd/log v0.1.0 // indirect
-	github.com/containerd/platforms v1.0.0-rc.4 // indirect
+	github.com/containerd/platforms v1.0.0-rc.5 // indirect
 	github.com/containerd/ttrpc v1.2.9 // indirect
 	github.com/containerd/typeurl/v2 v2.3.0 // indirect
 	github.com/davecgh/go-spew v1.1.2-0.20180830191138-d8f796af33cc // indirect
@@ -269,3 +269,6 @@ require (
 // replace github.com/livekit/protocol => ../protocol
 
 tool github.com/oapi-codegen/oapi-codegen/v2/cmd/oapi-codegen
+
+// Fork with capture-timestamp pacing for reader tracks (branch usertimestamp-pacing).
+replace github.com/livekit/server-sdk-go/v2 => github.com/haffi96/server-sdk-go/v2 v2.0.0-20260914215627-58be3fc63795
